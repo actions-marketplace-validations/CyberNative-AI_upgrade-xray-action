@@ -5,7 +5,7 @@ import { code } from './markdown.js';
 
 const basename = (p) => p.slice(p.lastIndexOf('/') + 1);
 
-export const LOCKFILE_NAMES = new Set(['package-lock.json', 'npm-shrinkwrap.json', 'pnpm-lock.yaml', 'uv.lock', 'poetry.lock']);
+export const LOCKFILE_NAMES = new Set(['package-lock.json', 'npm-shrinkwrap.json', 'pnpm-lock.yaml', 'yarn.lock', 'bun.lock', 'uv.lock', 'poetry.lock']);
 // pip requirements files as Dependabot and Renovate update them: requirements.txt,
 // requirements-dev.txt, requirements_test.txt, requirements/base.txt.
 const REQUIREMENTS_NAME = /^requirements(?:[-_.][\w.-]+)?\.txt$/i;
@@ -20,13 +20,17 @@ const MAX_LISTED = 10;
  */
 export function pickLockfiles(files, { only = [], max = 3 } = {}) {
     const notes = [];
-    const wanted = (f) => (only.length ? only.includes(f.filename) : isLockfilePath(f.filename));
+    const wanted = (f) => (only.length ? only.includes(f.filename) : isLockfilePath(f.filename) || basename(f.filename) === 'bun.lockb');
     const checks = [];
     for (const f of files) {
         if (!wanted(f)) continue;
         if (only.length && !isLockfilePath(f.filename)) { notes.push(`${code(f.filename)} is not a supported lockfile name; skipped.`); continue; }
         if (f.status === 'added') { notes.push(`${code(f.filename)} is new in this pull request; there is no earlier version to compare.`); continue; }
         if (f.status === 'removed') continue;
+        if (basename(f.filename) === 'bun.lockb' && !only.length) {
+            if (!files.some((g) => g.filename === `${f.filename.slice(0, -1)}`)) notes.push(`${code(f.filename)} is a binary lockfile and is not read; bun 1.2 and later can write a text \`bun.lock\` instead.`);
+            continue;
+        }
         checks.push({ path: f.filename, beforePath: f.status === 'renamed' && f.previous_filename ? f.previous_filename : f.filename });
     }
     if (checks.length > max) {
@@ -48,7 +52,11 @@ const FORMATS = {
     yaml: { label: 'YAML', parse: yamlDocuments, stringify: (docs) => docs.map((d) => `---\n${YAML.stringify(d, { lineWidth: 0 })}`).join('') },
     toml: { label: 'TOML', parse: (t) => parseToml(t), stringify: (d) => stringifyToml(d) },
     // pip requirements: the Actor's logical lines (comments removed, continuations joined), one per line.
-    lines: { label: 'requirements file', invalid: 'it has a line that is not a requirement, an option spelled in full or a comment', parse: requirementFile, clean: cleanWords, stringify: (lines) => lines.map((l) => `${l}\n`).join('') },
+    // Yarn 1 lockfiles: the Actor's own reader; written back with every key and value quoted.
+    yarn: { label: 'Yarn lockfile', parse: parseYarnV1, stringify: stringifyYarnV1 },
+    // bun.lock is JSON with trailing commas; it is sent as plain JSON.
+    jsonc: { label: 'bun.lock', parse: parseBunText, stringify: (d) => `${JSON.stringify(d, null, 2)}\n` },
+    lines: { label: 'requirements file', invalid: 'it has a line that is not a requirement, an option spelled in full or a comment', parse: requirementFile, clean: cleanWords, stringify: (lines) => lines.map((l) => `${continuedLine(l)}\n`).join('') },
 };
 // The Actor's requirements grammar and line reading, copied from its src/lockfile.js. A line outside
 // it is never sent: the Actor would refuse the file anyway, and a line this check cannot read could
@@ -57,11 +65,17 @@ const FORMATS = {
 // JavaScript split and trim these differently.
 const REQ_ODD_CHAR = /[\0-\x08\x0b\x0c\x0e-\x1f\x7f\x85\xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]|\r(?!\n)/;
 
+// A physical line longer than this is refused before any pattern reads it. pip-compile writes
+// lines of a few hundred characters at most: a requirement with many hashes is continued over
+// many short lines.
+const REQ_MAX_LINE = 16384;
+
 /**
  * Logical lines, as pip's preprocess makes them: a line ending in a backslash is joined to the
  * next with the backslashes at both of its ends removed, unless it is a comment line; then a
  * comment ("#" at the start or after white space) is removed from the joined line, so a comment
- * continued by a backslash also removes the line after it.
+ * continued by a backslash also removes the line after it. Every step is linear in the line's
+ * length: a joined line can be as long as the file.
  */
 function requirementLines(text) {
     const body = text.replace(/^\ufeff/, '');
@@ -69,13 +83,51 @@ function requirementLines(text) {
     const joined = [];
     let cur = null;
     for (const line of body.split(/\r?\n/)) {
+        if (line.length > REQ_MAX_LINE) throw new Error(`requirements file: it has a line longer than ${REQ_MAX_LINE} characters`);
         const comment = /^\s*#/.test(line);
-        if (line.endsWith('\\') && !comment) { cur = (cur ?? '') + line.replace(/^\\+|\\+$/g, ''); continue; }
+        if (line.endsWith('\\') && !comment) { cur = (cur ?? '') + trimBackslashes(line); continue; }
         joined.push((cur ?? '') + (comment ? ` ${line}` : line));
         cur = null;
     }
     if (cur !== null) joined.push(cur);
-    return joined.map((l) => l.replace(/(^|\s+)#.*$/, '').trim()).filter(Boolean);
+    return joined.map((l) => removeComment(l).trim()).filter(Boolean);
+}
+
+// The Actor refuses a line longer than REQ_MAX_LINE, but a joined line can be longer (a requirement
+// with many hashes). Such a line is sent split at spaces into continued lines, as pip-compile writes
+// it; pip joins them back into the same line. A line with no space to split at is left as it is,
+// and the check that parses the result then refuses the file.
+function continuedLine(line) {
+    const out = [];
+    let at = 0;
+    while (line.length - at > REQ_MAX_LINE) {
+        const cut = line.lastIndexOf(' ', at + REQ_MAX_LINE - 2);
+        if (cut <= at) break;
+        out.push(`${line.slice(at, cut + 1)}\\`);
+        at = cut + 1;
+    }
+    out.push(line.slice(at));
+    return out.join('\n');
+}
+
+// line.replace(/^\\+|\\+$/g, ''), without the retry at every backslash of a run inside the line.
+function trimBackslashes(line) {
+    let a = 0; let b = line.length;
+    while (a < b && line[a] === '\\') a++;
+    while (b > a && line[b - 1] === '\\') b--;
+    return line.slice(a, b);
+}
+
+// line.replace(/(^|\s+)#.*$/, ''), which retries at every space of a run: the first "#" at the
+// start of the line or after white space ends it, with that white space.
+function removeComment(line) {
+    for (let i = line.indexOf('#'); i >= 0; i = line.indexOf('#', i + 1)) {
+        if (i === 0) return '';
+        let j = i;
+        while (j > 0 && /\s/.test(line[j - 1])) j--;
+        if (j < i) return line.slice(0, j);
+    }
+    return line;
 }
 
 // The options pip reads in a requirements file, spelled in full. pip also takes abbreviations
@@ -124,7 +176,9 @@ function readRequirementLine(line) {
         return { options };
     }
     const requirement = (at < 0 ? words : words.slice(0, at)).join(' ');
-    if (!REQ_ARGS.test(requirement)) return null;
+    // REQ_ARGS reads a run of white space the same as one space. Its adjacent \s* would otherwise
+    // try every way of sharing a long run between them.
+    if (!REQ_ARGS.test(requirement.replace(/\s+/g, ' '))) return null;
     if (at > 0) {
         const opts = words.slice(at).join(' ');
         if (/["'\\]/.test(opts)) return null;
@@ -153,13 +207,115 @@ function requirementFile(text) {
 function cleanWords(line) {
     return line.split(/([ \t]+)/).map((w, i) => (i % 2 ? w : cleanString(w))).join('');
 }
+// The Actor's Yarn 1 and bun.lock readers, copied from its src/lockfile.js, so what is checked here is
+// what the Actor reads. Anything outside them is refused and never sent.
+const YARN_BARE = /^[A-Za-z][^\s:,"\\[\]]*/;
+const YARN_QUOTED = /^"[^"\\\0-\x1f\x7f]*"/;
+// Yarn writes lines of a few hundred characters; a longer line is refused before it is scanned.
+const YARN_MAX_LINE = 16384;
+
+function yarnToken(rest) {
+    const m = rest.match(YARN_QUOTED) || rest.match(YARN_BARE);
+    if (!m) return null;
+    const raw = m[0];
+    if (raw[0] !== '"' && /^(true|false)/.test(raw)) return raw === 'true' || raw === 'false' ? { value: raw === 'true', len: raw.length } : null;
+    return { value: raw[0] === '"' ? raw.slice(1, -1) : raw, len: raw.length };
+}
+
+function parseYarnV1(text) {
+    if (/\r(?!\n)/.test(text)) throw new Error('yarn.lock: it has a line break this tool does not read');
+    const entries = [];
+    const stack = [];
+    const seenKeys = new Set();
+    for (const [i, line0] of text.split(/\r?\n/).entries()) {
+        const bad = (why) => new Error(`yarn.lock line ${i + 1}: ${why}`);
+        if (line0.length > YARN_MAX_LINE) throw bad(`it is longer than ${YARN_MAX_LINE} characters`);
+        // Trailing spaces are dropped by a loop: a regex such as / +$/ retries at every space of a run.
+        let end = line0.length;
+        while (end > 0 && line0.charCodeAt(end - 1) === 32) end--;
+        const line = line0.slice(0, end);
+        if (!line || /^ *#/.test(line)) continue;
+        const indent = line.match(/^ */)[0].length;
+        if (indent % 2 || /^ *\t/.test(line)) throw bad('indentation is not a multiple of two spaces');
+        const level = indent / 2;
+        if (level > stack.length || level > 4) throw bad('unexpected indentation');
+        stack.length = level;
+        let rest = line.slice(indent);
+        const tokens = [];
+        let opens = false;
+        for (;;) {
+            const t = yarnToken(rest);
+            if (!t || typeof t.value !== 'string') throw bad('not a key this tool reads');
+            tokens.push(t.value);
+            rest = rest.slice(t.len);
+            if (rest === ':') { opens = true; break; }
+            if (rest.startsWith(', ')) { rest = rest.slice(2); continue; }
+            break;
+        }
+        if (opens) {
+            const obj = {};
+            if (level === 0) {
+                for (const k of tokens) { if (seenKeys.has(k)) throw bad('a key appears twice'); seenKeys.add(k); }
+                entries.push({ keys: tokens, fields: obj });
+            } else {
+                if (tokens.length !== 1) throw bad('a field has more than one name');
+                if (Object.hasOwn(stack[level - 1], tokens[0])) throw bad('a field appears twice');
+                stack[level - 1][tokens[0]] = obj;
+            }
+            stack.push(obj);
+            continue;
+        }
+        if (level === 0 || tokens.length !== 1 || !rest.startsWith(' ')) throw bad('not a field this tool reads');
+        const v = yarnToken(rest.slice(1));
+        if (!v || rest.length !== 1 + v.len) throw bad('not a value this tool reads');
+        if (Object.hasOwn(stack[level - 1], tokens[0])) throw bad('a field appears twice');
+        stack[level - 1][tokens[0]] = v.value;
+    }
+    return entries;
+}
+
+function stringifyYarnV1(entries) {
+    const q = (s) => JSON.stringify(s);
+    const fields = (obj, depth) => Object.entries(obj).map(([k, v]) => {
+        const pad = '  '.repeat(depth);
+        if (typeof v === 'boolean') return `${pad}${q(k)} ${v}\n`;
+        if (typeof v === 'string') return `${pad}${q(k)} ${q(v)}\n`;
+        return `${pad}${q(k)}:\n${fields(v, depth + 1)}`;
+    }).join('');
+    return `# yarn lockfile v1\n${entries.map((e) => `\n${e.keys.map(q).join(', ')}:\n${fields(e.fields, 1)}`).join('')}`;
+}
+
+// A comment ("/" outside a string) is left in and makes the result invalid JSON, so it is refused.
+function parseBunText(text) {
+    let out = ''; let inStr = false;
+    for (let i = 0; i < text.length; i++) {
+        const c = text[i];
+        if (inStr) {
+            out += c;
+            if (c === '\\') out += text[++i] ?? '';
+            else if (c === '"') inStr = false;
+            continue;
+        }
+        if (c === '"') { inStr = true; out += c; continue; }
+        if (c === ',') {
+            let j = i + 1;
+            while (j < text.length && ' \t\n\r'.includes(text[j])) j++;
+            if (text[j] === '}' || text[j] === ']') continue;
+        }
+        out += c;
+    }
+    return JSON.parse(out);
+}
+
 function yamlDocuments(text) {
     const docs = YAML.parseAllDocuments(text);
     if (!Array.isArray(docs)) return [];
     for (const d of docs) if (d.errors.length) throw d.errors[0];
     return docs.map((d) => d.toJS({ maxAliasCount: 10000 }));
 }
-const formatOf = (name) => FORMATS[name.endsWith('.json') ? 'json' : name.endsWith('.yaml') ? 'yaml' : name.endsWith('.txt') ? 'lines' : 'toml'];
+// yarn.lock is YAML from Yarn 2 on (it starts with "__metadata:", which Yarn 1 syntax cannot have).
+const formatOf = (name, text) => FORMATS[name === 'yarn.lock' ? (/^__metadata:/m.test(text) ? 'yaml' : 'yarn')
+    : name === 'bun.lock' ? 'jsonc' : name.endsWith('.json') ? 'json' : name.endsWith('.yaml') ? 'yaml' : name.endsWith('.txt') ? 'lines' : 'toml'];
 
 const SCHEME_CHAR = /[a-z0-9+.-]/i;
 const LETTER = /[a-z]/i;
@@ -327,7 +483,7 @@ export function unsafeUrls(text) {
  * come from the public registry.
  */
 export function redactLockfile(text, name) {
-    const fmt = formatOf(name);
+    const fmt = formatOf(name, text);
     let doc;
     try { doc = fmt.parse(text); } catch (e) { throw e instanceof RedactionError ? e : new RedactionError(fmt.invalid || `it is not valid ${fmt.label}`); }
     const out = fmt.stringify(mapStrings(doc, fmt.clean || cleanString));

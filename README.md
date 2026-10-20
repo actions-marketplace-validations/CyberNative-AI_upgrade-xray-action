@@ -1,6 +1,6 @@
 # Upgrade X-Ray for npm and PyPI dependency updates
 
-**See what a dependency update really changes before you merge it, computed from the published npm and PyPI files rather than the changelog.**
+**In seconds, at $0.02 per package diff or $0.25 per lockfile report, see what a dependency update really changes in its published npm or PyPI files (new install scripts; new network, shell or eval calls; removed exports; new dependencies) without installing it.**
 
 When a pull request changes a lockfile or a pip requirements file (a Dependabot or Renovate update, or your own), this Action sends the old and new lockfile to [Upgrade X-Ray](https://apify.com/cybernative-ai/upgrade-xray) on Apify and posts the result as one pull-request comment. For every package that changed, the comment shows:
 
@@ -27,6 +27,8 @@ on:
       - '**/package-lock.json'
       - '**/npm-shrinkwrap.json'
       - '**/pnpm-lock.yaml'
+      - '**/yarn.lock'
+      - '**/bun.lock'
       - '**/uv.lock'
       - '**/poetry.lock'
       - '**/requirements*.txt'
@@ -41,7 +43,7 @@ jobs:
       - uses: CyberNative-AI/upgrade-xray-action@v1
         with:
           apify-token: ${{ secrets.APIFY_TOKEN }}
-          # pnpm, Poetry and most requirements files do not record where packages
+          # pnpm, Yarn 2+, bun, Poetry and most requirements files do not record where packages
           # come from, so those packages are listed but not checked. If this
           # repository installs only from the public npm registry or PyPI,
           # uncomment the next line:
@@ -69,7 +71,7 @@ The analysis runs in **your** Apify account and is charged there, per event:
 | `github-token` | `${{ github.token }}` | Reads the lockfiles and posts the comment. Needs `contents: read` and `pull-requests: write`. |
 | `lockfiles` | all changed | Only check these lockfile paths (one per line). |
 | `max-lockfiles` | `3` | At most this many lockfile reports per workflow run. |
-| `assume-public-registry` | `false` | pnpm, Poetry, requirements files without an `--index-url` line and some npm lockfiles do not record where a package came from. Such entries are listed but not looked up unless you set this to `true`. Leave it off if you use a private registry or mirror. |
+| `assume-public-registry` | `false` | pnpm, Yarn 2 and later, bun, Poetry, requirements files without an `--index-url` line and some npm lockfiles do not record where a package came from. Such entries are listed but not looked up unless you set this to `true`. Leave it off if you use a private registry or mirror. |
 | `packages` | | Package mode instead: one update per line, e.g. `npm:axios@1.7.9..1.8.0` or `pypi:requests@2.31.0..2.32.0`. Works on any event. |
 | `fail-on` | `never` | Fail the step on `review` (red) or `notice` (yellow or red) verdicts. |
 | `comment` | `true` | Set `false` to write only the job summary. |
@@ -81,7 +83,7 @@ The analysis runs in **your** Apify account and is charged there, per event:
 
 ## What leaves your repository
 
-- **To Apify (your own account):** the old and new content of each changed lockfile, with user names, passwords and query strings removed from every URL in it. The Action parses each lockfile with the same JSON, YAML and TOML parsers the analysis uses, cleans every key and value, and sends the data re-serialized. A requirements file is sent as its requirement and option lines only, as pip reads them (so a comment continued by a backslash is removed with the line after it), each word cleaned; a file with a line the analysis would not read the same way, or with an option set from an environment variable (`${VAR}`, which pip may expand into another package source), is not sent. Comments and the original formatting are therefore not sent. It then parses the result again and checks every value, also with the same URL parser the analysis uses, so unusual URL spellings such as `https:user:token@host` are caught too. If a lockfile does not parse, or cannot be shown to be clean, it is not sent, and the comment says so. The run's input, log and results stay in your Apify account under your retention settings. The publisher cannot see them unless you share the run.
+- **To Apify (your own account):** the old and new content of each changed lockfile, with user names, passwords and query strings removed from every URL in it. The Action parses each lockfile with the same JSON, YAML and TOML parsers the analysis uses, cleans every key and value, and sends the data re-serialized. A requirements file is sent as its requirement and option lines only, as pip reads them (so a comment continued by a backslash is removed with the line after it), each word cleaned; a file with a line the analysis would not read the same way, or with an option set from an environment variable (`${VAR}`, which pip may expand into another package source), is not sent. Comments and the original formatting are therefore not sent; a requirement longer than 16,384 characters (one with many hashes) is sent as continued lines, as pip-compile writes it. It then parses the result again and checks every value, also with the same URL parser the analysis uses, so unusual URL spellings such as `https:user:token@host` are caught too. A lockfile over 20 MB is skipped. If a lockfile does not parse (this includes a line longer than 16,384 characters in a Yarn 1 `yarn.lock` or a requirements file), or cannot be shown to be clean, it is not sent, and the comment says so. The run's input, log and results stay in your Apify account under your retention settings. The publisher cannot see them unless you share the run.
 - **To the public npm registry and PyPI (from the Actor):** names and versions of packages whose lockfile entry shows they come from that registry. Packages from private registries, git or local paths are listed in the report but not looked up, and their names are not sent anywhere.
 - **To the pull request:** the report as a comment, visible to everyone who can see the pull request. It contains package names and versions, and the sources of entries that were not looked up. Every `@` in the comment, the job summary and the report file is followed by an invisible zero-width space, so npm scopes such as `@types/node` never notify GitHub users. If you copy a package name from the comment, delete that character. The comment is shortened to fit GitHub's size limit; the job summary has the full report.
 - **Which comment is updated:** the Action asks GitHub which account the token belongs to and updates only that account's earlier report. If GitHub does not say, the Action posts a new comment and changes no existing one.
